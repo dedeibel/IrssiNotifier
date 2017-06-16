@@ -38,6 +38,10 @@ my @delayQueue = ();
 
 my $screen_socket_path;
 
+
+use Time::HiRes qw(sleep);
+my @previous_ignore = qw(!PRIVATE joined);
+my %previous = ();
 sub private {
     my ( $server, $msg, $nick, $address ) = @_;
     $lastServer  = $server;
@@ -78,6 +82,182 @@ sub dcc {
     $lastDcc = 1;
 }
 
+sub prev_is_ignored {
+  my ($prev) = @_;
+  foreach my $ignore (@previous_ignore) {
+    return 1 if $prev->{target} eq $ignore;
+    return 1 if $prev->{msg} eq $ignore;
+  }
+  return 0;
+}
+
+sub prev_key {
+  my ($prev) = @_;
+  my $tag = $prev->{tag} || '';
+  return "$tag-$prev->{target}";
+}
+
+sub prev_init {
+  my ($prev) = @_;
+  if (! exists $previous{prev_key($prev)}) {
+    $previous{prev_key($prev)} = [];
+  }
+}
+
+sub prev_queue_size {
+  my ($prev) = @_;
+  return scalar(@{ $previous{prev_key($prev)} });
+}
+
+sub prev_queue_shift {
+  my ($prev) = @_;
+  shift(@{ $previous{prev_key($prev)} });
+}
+
+sub prev_queue_add {
+  my ($prev) = @_;
+  push(@{ $previous{prev_key($prev)} }, $prev);
+}
+
+sub prev_new {
+  return {
+    tag => $_[0]->{tag},
+    msg => $_[1],
+    nick => $_[2],
+    target => $_[3],
+    window => $_[4],
+    dcc => $_[5]
+  };
+}
+
+sub prev_new_from_last {
+  return prev_new($lastServer, $lastMsg, $lastNick, $lastTarget, $lastWindow, $lastDcc);
+}
+
+sub prev_add {
+  my ($prev) = @_;
+  prev_init($prev);
+  prev_queue_shift($prev) if (prev_queue_size($prev) >= 4); # 3 + 1 current notify msg
+  prev_queue_add($prev);
+}
+
+sub prev_pop_entries {
+  my ($prev) = @_;
+  my $entries = [
+    @{ $previous{prev_key($prev)} }
+  ];
+  delete $previous{prev_key($prev)};
+  return $entries;
+}
+
+sub prev_send {
+  my ($prev) = @_;
+    if ($forked) {
+        if (scalar @delayQueue < 10) {
+            push @delayQueue, {
+                            'msg' => $prev->{msg},
+                            'nick' => $prev->{nick},
+                            'target' => $prev->{target},
+                            'added' => time,
+                            };
+        } else {
+            Irssi::print("IrssiNotifier: previous send is still in progress and queue is full, skipping notification");
+        }
+        return 0;
+    }
+    $lastMsg = $prev->{msg};
+    $lastNick = $prev->{nick};
+    $lastTarget = $prev->{target};
+    send_to_api();
+}
+
+sub prev_send_all {
+  for my $pmesg (@{ prev_pop_entries(prev_new_from_last()) }) {
+    prev_send($pmesg);
+  }
+}
+
+sub prev_test_and_send {
+  if ($lastMsg =~ m/\Q^\E/) {
+    prev_add(prev_new_from_last());
+    prev_send_all()
+  }
+  else {
+    send_notification();
+  }
+}
+
+sub prev_should_store {
+    my $dest = @_ ? shift : $_;
+
+    if (
+      !are_settings_valid() ||
+      (Irssi::settings_get_bool("irssinotifier_away_only") && !$lastServer->{usermode_away}) ||
+      ($lastDcc && !Irssi::settings_get_bool("irssinotifier_enable_dcc")) ||
+      (Irssi::settings_get_bool('irssinotifier_screen_detached_only') && attached()) ||
+      (Irssi::settings_get_bool("irssinotifier_ignore_active_window") && $dest->{window}->{refnum} == Irssi::active_win()->{refnum})
+    ) {
+        return 0;
+    }
+
+    my $ignored_servers_string = Irssi::settings_get_str("irssinotifier_ignored_servers");
+    if ($ignored_servers_string) {
+        my @ignored_servers = split(/ /, $ignored_servers_string);
+        my $server;
+
+        foreach $server (@ignored_servers) {
+            if (lc($server) eq lc($lastServer->{tag})) {
+                return 0; # ignored server
+            }
+        }
+    }
+
+    my $ignored_channels_string = Irssi::settings_get_str("irssinotifier_ignored_channels");
+    if ($ignored_channels_string) {
+        my @ignored_channels = split(/ /, $ignored_channels_string);
+        my $channel;
+
+        foreach $channel (@ignored_channels) {
+            if (lc($channel) eq lc($lastWindow)) {
+                return 0; # ignored channel
+            }
+        }
+    }
+
+    # Ignore any highlights from given nicks
+    my $ignored_nicks_string = Irssi::settings_get_str("irssinotifier_ignored_nicks");
+    if ($ignored_nicks_string ne '') {
+        my @ignored_nicks = split(/ /, $ignored_nicks_string);
+        if (grep { lc($_) eq lc($lastNick) } @ignored_nicks) {
+            return 0; # Ignored nick
+        }
+    }
+
+    # Ignore any highlights that match any specified patterns
+    my $ignored_highlight_pattern_string = Irssi::settings_get_str("irssinotifier_ignored_highlight_patterns");
+    if ($ignored_highlight_pattern_string ne '') {
+        my @ignored_patterns = split(/ /, $ignored_highlight_pattern_string);
+        if (grep { $lastMsg =~ /$_/i } @ignored_patterns) {
+            return 0; # Ignored pattern
+        }
+    }
+
+    my $timeout = Irssi::settings_get_int('irssinotifier_require_idle_seconds');
+    if ($timeout > 0 && (time - $lastKeyboardActivity) <= $timeout && attached()) {
+        return 0; # not enough idle seconds
+    }
+
+    if (prev_is_ignored(prev_new_from_last())) {
+      return 0;
+    }
+
+    return 1;
+}
+
+sub prev_delay_queue_sleep_to_keep_order {
+  sleep(1.8);
+}
+
 sub print_text {
     my ($dest, $text, $stripped) = @_;
 
@@ -89,7 +269,10 @@ sub print_text {
 
     if (should_send_notification($dest))
     {
-        send_notification();
+        prev_test_and_send();
+    }
+    elsif (prev_should_store($dest)) {
+      prev_add(prev_new_from_last());
     }
 }
 
@@ -447,6 +630,7 @@ sub check_delayQueue {
           check_delayQueue();
           return 0;
       } else {
+          prev_delay_queue_sleep_to_keep_order();
           $lastMsg = $item->{'msg'};
           $lastNick = $item->{'nick'};
           $lastTarget = $item->{'target'};
