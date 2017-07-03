@@ -1,5 +1,6 @@
 use strict;
 use warnings;
+use utf8;
 no warnings 'closure';
 
 use Irssi;
@@ -178,7 +179,7 @@ sub prev_send_all {
 }
 
 sub prev_test_and_send {
-  if ($lastMsg =~ m/\Q^\E/) {
+  if ($lastMsg =~ m/\Q^\E|↑/) {
     prev_add(prev_new_from_last());
     prev_send_all()
   }
